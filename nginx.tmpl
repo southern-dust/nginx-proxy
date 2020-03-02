@@ -1,5 +1,6 @@
 {{ $CurrentContainer := where $ "ID" .Docker.CurrentContainerID | first }}
 
+
 {{ define "upstream" }}
 	{{ if .Address }}
 		{{/* If we got the containers from swarm and this container's port is published to host, use host IP:PORT */}}
@@ -64,6 +65,7 @@
 		ssl_prefer_server_ciphers on;
 	{{ end }}
 {{ end }}
+
 
 # If we receive X-Forwarded-Proto, pass it through; otherwise, pass along the
 # scheme used to connect to this server
@@ -135,7 +137,7 @@ proxy_set_header X-Forwarded-Port $proxy_x_forwarded_port;
 proxy_set_header Proxy "";
 {{ end }}
 
-{{ $enable_ipv6 := eq (or ($.Env.ENABLE_IPV6) "") "true" }}
+#{{ $enable_ipv6 := eq (or ($.Env.ENABLE_IPV6) "") "true" }}
 server {
 	server_name _; # This is just an invalid value which will never trigger on a real hostname.
 	listen 80;
@@ -143,25 +145,50 @@ server {
 	listen [::]:80;
 	{{ end }}
 	access_log /var/log/nginx/access.log vhost;
-	return 503;
-}
 
-{{ if (and (exists "/etc/nginx/certs/default.crt") (exists "/etc/nginx/certs/default.key")) }}
-server {
-	server_name _; # This is just an invalid value which will never trigger on a real hostname.
-	listen 443 ssl http2;
-	{{ if $enable_ipv6 }}
-	listen [::]:443 ssl http2;
+
+	location /{
+		root /app/www/;
+	}
+
+
+	{{/* Location Based Proxy */}}
+	{{ range $host_lbp, $containers_lbp := groupByMulti $ "Env.VIRTUAL_HOST" "," }}
+		{{ $location_lbp := trim (or (first (groupByKeys $containers_lbp "Env.VIRTUAL_LOCATION")) "/") }}
+		
+		location {{ $location_lbp }}/{
+			{{/* template "proxy_settings" $ */}}
+			proxy_pass http://{{ $host_lbp }}/;
+		}
+		location {{ $location_lbp }} {
+			{{/* template "proxy_settings" $ */}}
+			proxy_pass http://{{ $host_lbp }}/;
+		}
 	{{ end }}
-	access_log /var/log/nginx/access.log vhost;
-	return 503;
 
-	ssl_session_cache shared:SSL:50m;
-	ssl_session_tickets off;
-	ssl_certificate /etc/nginx/certs/default.crt;
-	ssl_certificate_key /etc/nginx/certs/default.key;
+	
+	
+	
+
+	#return 503;
 }
-{{ end }}
+
+#{{ if (and (exists "/etc/nginx/certs/default.crt") (exists "/etc/nginx/certs/default.key")) }}
+#server {
+#	server_name _; # This is just an invalid value which will never trigger on a real hostname.
+#	listen 443 ssl http2;
+#	{{ if $enable_ipv6 }}
+#	listen [::]:443 ssl http2;
+#	{{ end }}
+#	access_log /var/log/nginx/access.log vhost;
+	#return 503;
+
+#	ssl_session_cache shared:SSL:50m;
+#	ssl_session_tickets off;
+#	ssl_certificate /etc/nginx/certs/default.crt;
+#	ssl_certificate_key /etc/nginx/certs/default.key;
+#}
+#{{ end }}
 
 {{ range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST" "," }}
 
@@ -199,8 +226,13 @@ upstream {{ $upstream_name }} {
 {{ end }}
 }
 
+
 {{ $default_host := or ($.Env.DEFAULT_HOST) "" }}
 {{ $default_server := index (dict $host "" $default_host "default_server") $host }}
+
+{{/* Get the VIRTUAL_LOCATION defined by containers w/ the same vhost, falling back to "/" */}}
+{{/* $location must NOT end with slash '/', for example "/some/path" */}}
+{{ $location := trim (or (first (groupByKeys $containers "Env.VIRTUAL_LOCATION")) "/") }}
 
 {{/* Get the VIRTUAL_PROTO defined by containers w/ the same vhost, falling back to "http" */}}
 {{ $proto := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROTO")) "http") }}
@@ -248,7 +280,14 @@ server {
 	access_log /var/log/nginx/access.log vhost;
 	
 	# Do not HTTPS redirect Let'sEncrypt ACME challenge
-	location /.well-known/acme-challenge/ {
+	location {{ $location }}/.well-known/acme-challenge/ {
+		auth_basic off;
+		allow all;
+		root /usr/share/nginx/html;
+		try_files $uri =404;
+		break;
+	}
+	location {{ $location }}/.well-known/acme-challenge {
 		auth_basic off;
 		allow all;
 		root /usr/share/nginx/html;
@@ -256,7 +295,10 @@ server {
 		break;
 	}
 	
-	location / {
+	location {{ $location }}/{
+		return 301 https://$host$request_uri;
+	}
+	location {{ $location }}{
 		return 301 https://$host$request_uri;
 	}
 }
@@ -304,7 +346,7 @@ server {
 	include /etc/nginx/vhost.d/default;
 	{{ end }}
 
-	location / {
+	location /{
 		{{ if eq $proto "uwsgi" }}
 		include uwsgi_params;
 		uwsgi_pass {{ trim $proto }}://{{ trim $upstream_name }};
@@ -315,7 +357,7 @@ server {
 		{{ else if eq $proto "grpc" }}
 		grpc_pass {{ trim $proto }}://{{ trim $upstream_name }};
 		{{ else }}
-		proxy_pass {{ trim $proto }}://{{ trim $upstream_name }};
+		proxy_pass {{ trim $proto }}://{{ trim $upstream_name }}/;
 		{{ end }}
 
 		{{ if (exists (printf "/etc/nginx/htpasswd/%s" $host)) }}
@@ -353,7 +395,7 @@ server {
 	include /etc/nginx/vhost.d/default;
 	{{ end }}
 
-	location / {
+	location /{
 		{{ if eq $proto "uwsgi" }}
 		include uwsgi_params;
 		uwsgi_pass {{ trim $proto }}://{{ trim $upstream_name }};
@@ -364,7 +406,7 @@ server {
 		{{ else if eq $proto "grpc" }}
 		grpc_pass {{ trim $proto }}://{{ trim $upstream_name }};
 		{{ else }}
-		proxy_pass {{ trim $proto }}://{{ trim $upstream_name }};
+		proxy_pass {{ trim $proto }}://{{ trim $upstream_name }}/;
 		{{ end }}
 		{{ if (exists (printf "/etc/nginx/htpasswd/%s" $host)) }}
 		auth_basic	"Restricted {{ $host }}";
